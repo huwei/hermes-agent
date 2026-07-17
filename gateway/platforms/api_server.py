@@ -4578,10 +4578,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as resp:
                     if resp.status == 200:
-                        result = await resp.json()
-                        # Unwrap the standard SuccessResult envelope:
-                        #   {"code": 0, "data": {...}}
-                        file_obj = result.get("data", result) if isinstance(result, dict) else {}
+                        file_obj = await resp.json()
                         logger.info(
                             "File uploaded to %s: %s -> %s",
                             self._upload_files_url,
