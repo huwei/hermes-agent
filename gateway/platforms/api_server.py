@@ -55,7 +55,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -941,6 +941,16 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._upload_files_url: str = extra.get(
+            "upload_files_url", os.getenv("API_UPLOAD_FILES_URL", "")
+        ).strip()
+        self._upload_files_key: str = extra.get(
+            "upload_files_key", os.getenv("API_UPLOAD_FILES_KEY", "")
+        ).strip()
+        self._upload_files_download_url: str = extra.get(
+            "upload_files_download_url",
+            os.getenv("API_UPLOAD_FILES_DOWNLOAD_URL", ""),
+        ).strip()
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -2390,19 +2400,21 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response, uploaded_files = await self._process_response_files(
+            result.get("final_response", "") if isinstance(result, dict) else ""
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
-        return web.json_response(
-            {
-                "object": "hermes.session.chat.completion",
-                "session_id": effective_session_id or session_id,
-                "message": {"role": "assistant", "content": final_response},
-                "usage": usage,
-            },
-            headers=headers,
-        )
+        resp_data = {
+            "object": "hermes.session.chat.completion",
+            "session_id": effective_session_id or session_id,
+            "message": {"role": "assistant", "content": final_response},
+            "usage": usage,
+        }
+        if uploaded_files:
+            resp_data["files"] = uploaded_files
+        return web.json_response(resp_data, headers=headers)
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
@@ -2478,7 +2490,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                final_response, uploaded_files = await self._process_response_files(
+                    result.get("final_response", "") if isinstance(result, dict) else ""
+                )
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 await queue.put(_event_payload("assistant.completed", {
@@ -2489,13 +2503,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     "partial": False,
                     "interrupted": False,
                 }))
-                await queue.put(_event_payload("run.completed", {
+                run_completed_payload = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "completed": True,
                     "messages": turn_messages,
                     "usage": usage,
-                }))
+                }
+                if uploaded_files:
+                    run_completed_payload["files"] = uploaded_files
+                await queue.put(_event_payload("run.completed", run_completed_payload))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
@@ -2804,7 +2821,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response, _ = await self._process_response_files(
+            result.get("final_response") or ""
+        )
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -3505,6 +3524,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
+
+            # Process file uploads (MEDIA: tags, bare local paths) after
+            # the agent completes.  Text deltas were already streamed with
+            # raw tags; the terminal response.completed event carries the
+            # cleaned text + structured file items as the authoritative
+            # record.
+            cleaned_text, uploaded_files = await self._process_response_files(
+                final_response_text
+            )
+            final_response_text = cleaned_text or final_response_text
+
+            # Build file_citation annotations for uploaded files.
+            file_annotations: List[Dict[str, Any]] = []
+            if uploaded_files:
+                for idx, f_obj in enumerate(uploaded_files):
+                    file_annotations.append({
+                        "type": "file_citation",
+                        "file_id": f_obj["id"],
+                        "filename": f_obj["filename"],
+                        "index": idx,
+                    })
+
             if message_opened:
                 await _write_event("response.output_text.done", {
                     "type": "response.output_text.done",
@@ -3520,7 +3561,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                     "role": "assistant",
                     "content": [
-                        {"type": "output_text", "text": final_response_text}
+                        {
+                            "type": "output_text",
+                            "text": final_response_text,
+                            "annotations": file_annotations,
+                        }
                     ],
                 }
                 await _write_event("response.output_item.done", {
@@ -3563,7 +3608,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "type": "message",
                 "role": "assistant",
                 "content": [
-                    {"type": "output_text", "text": final_response_text or (_redact_api_error_text(agent_error) if agent_error else "")}
+                    {
+                        "type": "output_text",
+                        "text": final_response_text or (_redact_api_error_text(agent_error) if agent_error else ""),
+                        "annotations": file_annotations,
+                    }
                 ],
             })
 
@@ -3905,9 +3954,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        final_response, uploaded_files = await self._process_response_files(
+            result.get("final_response", "")
+        )
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
+        # Update result dict so _extract_output_items uses the cleaned text
+        # and _build_response_conversation_history stores the cleaned version.
+        if isinstance(result, dict):
+            result["final_response"] = final_response
+
+        # Build file_citation annotations for uploaded files so clients
+        # can discover structured file metadata via the standard Responses
+        # API annotation mechanism.
+        file_annotations: List[Dict[str, Any]] = []
+        if uploaded_files:
+            for idx, f_obj in enumerate(uploaded_files):
+                file_annotations.append({
+                    "type": "file_citation",
+                    "file_id": f_obj["id"],
+                    "filename": f_obj["filename"],
+                    "index": idx,
+                })
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
@@ -3929,7 +3997,10 @@ class APIServerAdapter(BasePlatformAdapter):
             user_message,
             result,
         )
-        output_items = self._extract_output_items(result, start_index=output_start_index)
+        output_items = self._extract_output_items(
+            result, start_index=output_start_index,
+            file_annotations=file_annotations or None,
+        )
 
         response_data = {
             "id": response_id,
@@ -4398,7 +4469,11 @@ class APIServerAdapter(BasePlatformAdapter):
         return out
 
     @staticmethod
-    def _extract_output_items(result: Dict[str, Any], start_index: int = 0) -> List[Dict[str, Any]]:
+    def _extract_output_items(
+        result: Dict[str, Any],
+        start_index: int = 0,
+        file_annotations: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Build the output item array from the agent's messages.
 
@@ -4406,6 +4481,10 @@ class APIServerAdapter(BasePlatformAdapter):
         - ``function_call`` items for each tool_call on assistant messages
         - ``function_call_output`` items for each tool-role message
         - a final ``message`` item with the assistant's text reply
+
+        When *file_annotations* is provided, each entry is a
+        ``file_citation`` annotation attached to the ``output_text``
+        content part of the final message item.
         """
         items: List[Dict[str, Any]] = []
         messages = result.get("messages", [])
@@ -4435,17 +4514,172 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final:
             final = _redact_api_error_text(result.get("error", "(No response generated)"))
 
+        output_text: Dict[str, Any] = {
+            "type": "output_text",
+            "text": final,
+            "annotations": file_annotations or [],
+        }
         items.append({
             "type": "message",
             "role": "assistant",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": final,
-                }
-            ],
+            "content": [output_text],
         })
         return items
+
+    # ------------------------------------------------------------------
+    # File upload to remote server (API_UPLOAD_FILES_URL)
+    # ------------------------------------------------------------------
+
+    async def _upload_file_to_server(
+        self, file_path: str, purpose: str = "user_data",
+    ) -> Optional[Dict[str, Any]]:
+        """Upload a file to the configured remote file server.
+
+        POSTs the file as multipart/form-data to ``API_UPLOAD_FILES_URL``
+        with an optional ``Authorization: Bearer`` header from
+        ``API_UPLOAD_FILES_KEY``.  Returns the uploaded file metadata dict
+        on success, or ``None`` when upload is not configured, the file
+        does not exist, or the server rejects the request.
+        """
+        if not self._upload_files_url:
+            return None
+
+        path = Path(file_path)
+        if not path.is_file():
+            logger.warning("File not found for upload: %s", file_path)
+            return None
+
+        headers: Dict[str, str] = {}
+        if self._upload_files_key:
+            headers["Authorization"] = f"Bearer {self._upload_files_key}"
+
+        import aiohttp
+
+        try:
+            form = aiohttp.FormData()
+            form.add_field("purpose", purpose)
+            form.add_field(
+                "file",
+                path.read_bytes(),
+                filename=path.name,
+                content_type="application/octet-stream",
+            )
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self._upload_files_url,
+                    data=form,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        # Unwrap the standard SuccessResult envelope:
+                        #   {"code": 0, "data": {...}}
+                        file_obj = result.get("data", result) if isinstance(result, dict) else {}
+                        logger.info(
+                            "File uploaded to %s: %s -> %s",
+                            self._upload_files_url,
+                            path.name,
+                            file_obj.get("id", "unknown"),
+                        )
+                        return file_obj
+                    body = await resp.text()
+                    logger.warning(
+                        "File upload failed (HTTP %s) for %s: %s",
+                        resp.status, path.name, body[:500],
+                    )
+                    return None
+        except Exception as exc:
+            logger.warning("File upload error for %s: %s", path.name, exc)
+            return None
+
+    async def _process_response_files(
+        self, text: str,
+    ) -> "Tuple[str, List[Dict[str, Any]]]":
+        """Extract and upload files referenced in agent response text.
+
+        When ``API_UPLOAD_FILES_URL`` is configured this method:
+
+        1. Extracts ``MEDIA:<path>`` tags and bare local file paths from
+           *text* (reusing ``BasePlatformAdapter.extract_media`` and
+           ``extract_local_files`` with their safety filters).
+        2. Uploads each file to the remote server via
+           ``_upload_file_to_server``.
+        3. Replaces local path references in the cleaned text with
+           ``[filename](file_id)`` markdown links.
+        4. Returns ``(cleaned_text, uploaded_file_items)``.
+
+        When ``API_UPLOAD_FILES_URL`` is **not** configured, falls back to
+        the existing ``_resolve_media_to_data_urls`` inlining and returns
+        an empty file-items list — preserving the prior behavior exactly.
+        """
+        if not text:
+            return text, []
+
+        # Fallback: no upload endpoint configured → inline images only
+        if not self._upload_files_url:
+            return _resolve_media_to_data_urls(text), []
+
+        # 1. Extract MEDIA: tags and their is_voice annotations
+        media_files, cleaned = BasePlatformAdapter.extract_media(text)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+
+        # 2. Extract bare local file paths from the already-cleaned text
+        local_files, cleaned = BasePlatformAdapter.extract_local_files(cleaned)
+        local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+
+        # Collect all unique file paths (media_files is List[(path, is_voice)])
+        all_paths: List[str] = [p for p, _ in media_files] + list(local_files)
+        seen: set[str] = set()
+        unique_paths: List[str] = []
+        for p in all_paths:
+            if p not in seen:
+                seen.add(p)
+                unique_paths.append(p)
+
+        if not unique_paths:
+            return _resolve_media_to_data_urls(cleaned).strip(), []
+
+        # 3. Upload each file
+        uploaded_items: List[Dict[str, Any]] = []
+        for file_path in unique_paths:
+            uploaded = await self._upload_file_to_server(file_path)
+            if uploaded:
+                file_id = uploaded.get("id", "")
+                file_name = uploaded.get("filename", Path(file_path).name)
+                file_obj: Dict[str, Any] = {
+                    "id": file_id,
+                    "object": "file",
+                    "bytes": uploaded.get("bytes", 0),
+                    "created_at": uploaded.get("created_at", 0),
+                    "filename": file_name,
+                    "purpose": uploaded.get("purpose", "user_data"),
+                }
+                # Pass through optional / deprecated fields from the
+                # upstream FileObject exactly as the backend returns them.
+                for _opt in ("expires_at", "status", "status_details"):
+                    if _opt in uploaded:
+                        file_obj[_opt] = uploaded[_opt]
+                uploaded_items.append(file_obj)
+                # Replace file path references in cleaned text with a link
+                # so API clients can discover the uploaded file.  When
+                # API_UPLOAD_FILES_DOWNLOAD_URL is configured the link is a
+                # direct download URL with ``{file_id}`` substituted;
+                # otherwise a ``file:`` reference scheme is used.
+                if self._upload_files_download_url:
+                    download_url = self._upload_files_download_url.replace(
+                        "{file_id}", file_id
+                    )
+                else:
+                    download_url = f"file:{file_id}"
+                cleaned = cleaned.replace(file_path, f"[{file_name}]({download_url})")
+
+        # 4. Any remaining MEDIA: tags that weren't uploaded (e.g. upload
+        #    failed) should still be inlined for images where possible.
+        cleaned = _resolve_media_to_data_urls(cleaned)
+
+        return cleaned.strip(), uploaded_items
 
     # ------------------------------------------------------------------
     # Agent execution
