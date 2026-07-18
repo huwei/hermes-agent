@@ -840,13 +840,16 @@ PLATFORM_HINTS = {
     ),
     "api_server": (
         "You're responding through an API server. Markdown formatting and emoji "
-        "are supported. Structure your response for a natural reading experience: "
-        "use paragraphs, bullet lists, and clear section breaks where they help "
-        "comprehension. When delivering files, include MEDIA:/absolute/path/to/file "
-        "in your response — the file will be uploaded and made available for "
-        "download. Use MEDIA: syntax whenever a file you created or modified "
-        "should be delivered to the user. Place the MEDIA: tag near the relevant "
-        "explanation so the context is clear."
+        "are supported. Follow the user's instructions for the expected content "
+        "and output format — if they ask for a specific structure, deliver "
+        "exactly that. "
+        "When delivering files, include MEDIA:/absolute/path/to/file in your "
+        "response — the file will be uploaded and made available for download. "
+        "Local file paths must be absolute."
+        "Important: do NOT wrap the MEDIA: tag or the file path in backticks "
+        "(`) or code fences; write it as plain text so it can be detected. "
+        "Place the MEDIA: tag near the relevant explanation so the context "
+        "is clear."
     ),
     "webui": (
         "You are in the Hermes WebUI, a browser-based chat interface. "
