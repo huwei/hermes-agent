@@ -3540,16 +3540,28 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             final_response_text = cleaned_text or final_response_text
 
-            # Build file_citation annotations for uploaded files.
+            # Build annotations for uploaded files (url_citation when
+            # a download URL is available, file_citation otherwise).
             file_annotations: List[Dict[str, Any]] = []
             if uploaded_files:
                 for idx, f_obj in enumerate(uploaded_files):
-                    file_annotations.append({
-                        "type": "file_citation",
-                        "file_id": f_obj["id"],
-                        "filename": f_obj["filename"],
-                        "index": idx,
-                    })
+                    download_url = f_obj.get("download_url", "")
+                    if download_url and not download_url.startswith("file:"):
+                        start = final_response_text.find(download_url)
+                        file_annotations.append({
+                            "type": "url_citation",
+                            "url": download_url,
+                            "title": f_obj["filename"],
+                            "start_index": start if start >= 0 else 0,
+                            "end_index": (start + len(download_url)) if start >= 0 else 0,
+                        })
+                    else:
+                        file_annotations.append({
+                            "type": "file_citation",
+                            "file_id": f_obj["id"],
+                            "filename": f_obj["filename"],
+                            "index": idx,
+                        })
 
             if message_opened:
                 await _write_event("response.output_text.done", {
@@ -3969,18 +3981,31 @@ class APIServerAdapter(BasePlatformAdapter):
         if isinstance(result, dict):
             result["final_response"] = final_response
 
-        # Build file_citation annotations for uploaded files so clients
-        # can discover structured file metadata via the standard Responses
-        # API annotation mechanism.
+        # Build annotations for uploaded files.  When a download URL is
+        # available (API_UPLOAD_FILES_DOWNLOAD_URL configured) we emit a
+        # ``url_citation`` that points to the URL's character position in
+        # the response text; otherwise we emit a ``file_citation`` with
+        # the file_id and filename.
         file_annotations: List[Dict[str, Any]] = []
         if uploaded_files:
             for idx, f_obj in enumerate(uploaded_files):
-                file_annotations.append({
-                    "type": "file_citation",
-                    "file_id": f_obj["id"],
-                    "filename": f_obj["filename"],
-                    "index": idx,
-                })
+                download_url = f_obj.get("download_url", "")
+                if download_url and not download_url.startswith("file:"):
+                    start = final_response.find(download_url)
+                    file_annotations.append({
+                        "type": "url_citation",
+                        "url": download_url,
+                        "title": f_obj["filename"],
+                        "start_index": start if start >= 0 else 0,
+                        "end_index": (start + len(download_url)) if start >= 0 else 0,
+                    })
+                else:
+                    file_annotations.append({
+                        "type": "file_citation",
+                        "file_id": f_obj["id"],
+                        "filename": f_obj["filename"],
+                        "index": idx,
+                    })
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
@@ -4488,8 +4513,8 @@ class APIServerAdapter(BasePlatformAdapter):
         - a final ``message`` item with the assistant's text reply
 
         When *file_annotations* is provided, each entry is a
-        ``file_citation`` annotation attached to the ``output_text``
-        content part of the final message item.
+        ``url_citation`` or ``file_citation`` annotation attached to the
+        ``output_text`` content part of the final message item.
         """
         items: List[Dict[str, Any]] = []
         messages = result.get("messages", [])
@@ -4663,19 +4688,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 for _opt in ("expires_at", "status", "status_details"):
                     if _opt in uploaded:
                         file_obj[_opt] = uploaded[_opt]
-                uploaded_items.append(file_obj)
-                # Replace file path references in cleaned text with a link
-                # so API clients can discover the uploaded file.  When
-                # API_UPLOAD_FILES_DOWNLOAD_URL is configured the link is a
-                # direct download URL with ``{file_id}`` substituted;
-                # otherwise a ``file:`` reference scheme is used.
+                # Replace file path references in cleaned text with a
+                # markdown link so clients can discover the uploaded file.
+                # When API_UPLOAD_FILES_DOWNLOAD_URL is configured the link
+                # target is a direct download URL; otherwise a ``file:``
+                # reference scheme is used.  The download URL is also
+                # stored on the file object for downstream url_citation
+                # annotation building.
                 if self._upload_files_download_url:
                     download_url = self._upload_files_download_url.replace(
                         "{file_id}", file_id
                     )
                 else:
                     download_url = f"file:{file_id}"
+                file_obj["download_url"] = download_url
                 cleaned = cleaned.replace(file_path, f"[{file_name}]({download_url})")
+                uploaded_items.append(file_obj)
 
         # 4. Any remaining MEDIA: tags that weren't uploaded (e.g. upload
         #    failed) should still be inlined for images where possible.
