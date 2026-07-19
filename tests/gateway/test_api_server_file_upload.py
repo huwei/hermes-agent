@@ -110,9 +110,9 @@ class TestProcessResponseFilesFallback:
         assert items == []
 
     def test_no_upload_url_strips_media_tags(self):
-        """Without API_UPLOAD_FILES_URL, MEDIA: tags are stripped and
-        images are inlined if possible; non-images are left as bare
-        text for reference."""
+        """Without API_UPLOAD_FILES_URL, MEDIA: tags are stripped.
+        No base64 inlining — images go through upload pipeline when
+        configured."""
         adapter = _make_adapter()
         png = _write_temp_file(".png")
         pdf = _write_temp_file(".pdf")
@@ -120,6 +120,7 @@ class TestProcessResponseFilesFallback:
         cleaned, items = asyncio.run(adapter._process_response_files(text))
         assert items == []
         assert "MEDIA:" not in cleaned
+        assert "data:image" not in cleaned
         assert "Before" in cleaned
         assert "After" in cleaned
 
@@ -229,8 +230,9 @@ class TestProcessResponseFilesUpload:
         )
         assert items[0]["download_url"] == "file:file_abc123"
 
-    def test_upload_failure_skips_file(self):
-        """When upload returns None the MEDIA: tag is still stripped."""
+    def test_upload_failure_preserves_tag(self):
+        """When upload returns None the MEDIA: tag stays as-is — the local
+        path is still useful for debugging."""
         adapter = _make_adapter(
             upload_files_url="https://api.example.com/v1/files",
         )
@@ -243,7 +245,8 @@ class TestProcessResponseFilesUpload:
         text = f"MEDIA:{pdf}"
         cleaned, items = asyncio.run(adapter._process_response_files(text))
         assert items == []
-        assert "MEDIA:" not in cleaned
+        assert str(pdf) in cleaned
+        assert "MEDIA:" in cleaned
 
     def test_multiple_files(self):
         adapter = _make_adapter(
@@ -346,6 +349,24 @@ class TestUploadFileToServer:
             adapter._upload_file_to_server("/nonexistent/path/file.pdf")
         )
         assert result is None
+
+    def test_oversized_file_rejected_before_read(self):
+        """A file exceeding MAX_UPLOAD_FILE_BYTES is rejected after stat(),
+        before any read/upload — protecting the event loop from a giant
+        allocation."""
+        from gateway.platforms import api_server as mod
+
+        adapter = _make_adapter(
+            upload_files_url="https://api.example.com/v1/files",
+        )
+        pdf = _write_temp_file(".pdf", content=b"x" * 1024)
+        orig = mod.MAX_UPLOAD_FILE_BYTES
+        mod.MAX_UPLOAD_FILE_BYTES = 512  # smaller than our 1 KiB file
+        try:
+            result = asyncio.run(adapter._upload_file_to_server(str(pdf)))
+            assert result is None
+        finally:
+            mod.MAX_UPLOAD_FILE_BYTES = orig
 
     @pytest.mark.asyncio
     async def test_successful_upload(self):
@@ -486,14 +507,19 @@ class TestUploadFileToServer:
             c[0] for c in mock_formdata.add_field.call_args_list
         ]
         assert ("purpose", "user_data") in add_field_calls
-        # file call: (field_name, bytes, filename=..., content_type=...)
+        # file call: (field_name, file_handle, filename=..., content_type=...)
         file_calls = [c for c in add_field_calls if c[0] == "file"]
         assert len(file_calls) == 1
         file_args = file_calls[0]
-        assert file_args[1] == b"hello world"
+        # The second positional arg is an open binary file handle (not bytes).
+        assert hasattr(file_args[1], "read"), "expected a file handle"
+        assert file_args[1].read() == b"hello world"
         assert mock_formdata.add_field.call_args_list[-1].kwargs.get(
             "filename"
         ) == pdf.name
+        assert mock_formdata.add_field.call_args_list[-1].kwargs.get(
+            "content_type"
+        ) == "application/octet-stream"
 
 
 # ---------------------------------------------------------------------------
@@ -524,10 +550,12 @@ class TestAnnotations:
         )
 
         # Build annotations the same way _handle_responses does.
+        # url_citation now spans the entire [filename](url) markdown link.
         download_url = items[0]["download_url"]
-        start = cleaned.find(download_url)
-        assert start > 0, "download URL must appear in cleaned text"
-        assert start + len(download_url) == len(cleaned) - 1  # ends with )
+        link_text = f"[{items[0]['filename']}]({download_url})"
+        start = cleaned.find(link_text)
+        assert start == 0, "markdown link must appear at the start of cleaned text"
+        assert cleaned[start + len(link_text) - 1] == ")"
 
     def test_file_citation_when_no_download_url(self):
         """Without API_UPLOAD_FILES_DOWNLOAD_URL, annotations use

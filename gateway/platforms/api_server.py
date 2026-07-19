@@ -127,6 +127,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024  # 100 MB — file upload size bound
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -3549,13 +3550,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 for idx, f_obj in enumerate(uploaded_files):
                     download_url = f_obj.get("download_url", "")
                     if download_url and not download_url.startswith("file:"):
-                        start = final_response_text.find(download_url)
+                        link_text = f"[{f_obj['filename']}]({download_url})"
+                        start = final_response_text.find(link_text)
                         file_annotations.append({
                             "type": "url_citation",
                             "url": download_url,
                             "title": f_obj["filename"],
                             "start_index": start if start >= 0 else 0,
-                            "end_index": (start + len(download_url)) if start >= 0 else 0,
+                            "end_index": (start + len(link_text)) if start >= 0 else 0,
                         })
                     else:
                         file_annotations.append({
@@ -3993,13 +3995,14 @@ class APIServerAdapter(BasePlatformAdapter):
             for idx, f_obj in enumerate(uploaded_files):
                 download_url = f_obj.get("download_url", "")
                 if download_url and not download_url.startswith("file:"):
-                    start = final_response.find(download_url)
+                    link_text = f"[{f_obj['filename']}]({download_url})"
+                    start = final_response.find(link_text)
                     file_annotations.append({
                         "type": "url_citation",
                         "url": download_url,
                         "title": f_obj["filename"],
                         "start_index": start if start >= 0 else 0,
-                        "end_index": (start + len(download_url)) if start >= 0 else 0,
+                        "end_index": (start + len(link_text)) if start >= 0 else 0,
                     })
                 else:
                     file_annotations.append({
@@ -4571,7 +4574,8 @@ class APIServerAdapter(BasePlatformAdapter):
         with an optional ``Authorization: Bearer`` header from
         ``API_UPLOAD_FILES_KEY``.  Returns the uploaded file metadata dict
         on success, or ``None`` when upload is not configured, the file
-        does not exist, or the server rejects the request.
+        does not exist, exceeds the size bound, or the server rejects the
+        request.
         """
         if not self._upload_files_url:
             return None
@@ -4581,6 +4585,20 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("File not found for upload: %s", file_path)
             return None
 
+        # Size guard — stat before reading so we never buffer a giant
+        # generated artifact into memory on the event loop.
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            logger.warning("File not accessible for upload: %s", file_path)
+            return None
+        if file_size > MAX_UPLOAD_FILE_BYTES:
+            logger.warning(
+                "File exceeds upload size limit (%s > %s bytes): %s",
+                file_size, MAX_UPLOAD_FILE_BYTES, file_path,
+            )
+            return None
+
         headers: Dict[str, str] = {}
         if self._upload_files_key:
             headers["Authorization"] = f"Bearer {self._upload_files_key}"
@@ -4588,11 +4606,15 @@ class APIServerAdapter(BasePlatformAdapter):
         import aiohttp
 
         try:
+            # Stream the file from a handle so we never buffer the entire
+            # artifact on the event loop.  aiohttp.FormData reads the
+            # handle lazily during the POST, chunking through the
+            # multipart boundary writer.
             form = aiohttp.FormData()
             form.add_field("purpose", purpose)
             form.add_field(
                 "file",
-                path.read_bytes(),
+                path.open("rb"),
                 filename=path.name,
                 content_type="application/octet-stream",
             )
@@ -4606,12 +4628,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 ) as resp:
                     if resp.status == 200:
                         file_obj = await resp.json()
-                        logger.info(
-                            "File uploaded to %s: %s -> %s",
-                            self._upload_files_url,
-                            path.name,
-                            file_obj.get("id", "unknown"),
-                        )
+                        if not isinstance(file_obj, dict):
+                            logger.warning(
+                                "File upload response is not a JSON object for %s",
+                                path.name,
+                            )
+                            return None
                         return file_obj
                     body = await resp.text()
                     logger.warning(
@@ -4637,21 +4659,20 @@ class APIServerAdapter(BasePlatformAdapter):
         3. Replaces each successfully-uploaded ``MEDIA:<path>`` tag or bare
            path in the **original** text with a ``[filename](url)`` markdown
            link — preserving the original position.
-        4. Strips any remaining (un-uploaded) MEDIA: tags and inlines
-           remaining images via ``_resolve_media_to_data_urls``.
+        4. Tags that could not be uploaded are left as-is in the text.
 
-        When ``API_UPLOAD_FILES_URL`` is **not** configured, falls back to
-        the existing ``_resolve_media_to_data_urls`` inlining and returns
-        an empty file-items list — preserving the prior behavior exactly.
+        When ``API_UPLOAD_FILES_URL`` is **not** configured, strips
+        MEDIA: tags and returns an empty file-items list.  Images are
+        NOT inlined — all files (including images) go through the
+        upload pipeline when configured.
         """
         if not text:
             return text, []
 
         # Fallback: no upload endpoint configured → strip MEDIA: tags,
-        # inline images, keep bare paths as-is.
+        # keep bare paths and non-image references as-is.
         if not self._upload_files_url:
             _, cleaned = BasePlatformAdapter.extract_media(text)
-            cleaned = _resolve_media_to_data_urls(cleaned)
             return cleaned.strip(), []
 
         # 1. Discover files — extract paths from text without modifying it.
@@ -4671,8 +4692,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 unique_paths.append(p)
 
         if not unique_paths:
-            # Nothing to upload — still clean up MEDIA: tags from the text.
-            return _resolve_media_to_data_urls(text).strip(), []
+            # No discoverable file paths — leave text as-is.
+            return text.strip(), []
 
         # 2. Upload each file — build path → file_obj mapping.
         path_to_file: Dict[str, Dict[str, Any]] = {}
@@ -4702,9 +4723,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 path_to_file[file_path] = file_obj
 
         if not path_to_file:
-            _, cleaned = BasePlatformAdapter.extract_media(text)
-            cleaned = _resolve_media_to_data_urls(cleaned)
-            return cleaned.strip(), []
+            # No files were uploaded — leave text as-is for debugging.
+            return text.strip(), []
 
         # 3. Replace file references in the original text with markdown
         #    links at the original positions.  Process MEDIA: tags first
@@ -4771,10 +4791,8 @@ class APIServerAdapter(BasePlatformAdapter):
             uploaded_ids.add(file_obj["id"])
             uploaded_items.append(file_obj)
 
-        # 4. Strip any remaining MEDIA: tags (files that weren't uploaded)
-        #    and inline remaining images.
-        cleaned = BasePlatformAdapter.strip_media_directives_for_display(cleaned)
-        cleaned = _resolve_media_to_data_urls(cleaned)
+        # 4. All discovered files (including images) go through the upload
+        #    pipeline.  Tags that weren't uploaded are left as-is.
 
         return cleaned.strip(), uploaded_items
 
