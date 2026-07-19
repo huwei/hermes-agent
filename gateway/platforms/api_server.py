@@ -3567,6 +3567,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             "index": idx,
                         })
 
+            # Sort annotations by position in text so they appear in
+            # natural reading order (smallest start_index first).
+            file_annotations.sort(
+                key=lambda a: a.get("start_index", a.get("index", 0))
+            )
+
             if message_opened:
                 await _write_event("response.output_text.done", {
                     "type": "response.output_text.done",
@@ -4011,6 +4017,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "filename": f_obj["filename"],
                         "index": idx,
                     })
+
+        # Sort annotations by position in text (smallest start_index first).
+        file_annotations.sort(
+            key=lambda a: a.get("start_index", a.get("index", 0))
+        )
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
