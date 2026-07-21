@@ -3644,19 +3644,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Build annotations for uploaded files (url_citation when
             # a download URL is available, file_citation otherwise).
+            # Items arrive from _process_response_files in text order.
             file_annotations: List[Dict[str, Any]] = []
             if uploaded_files:
                 for idx, f_obj in enumerate(uploaded_files):
                     download_url = f_obj.get("download_url", "")
+                    link_text = f"[{f_obj['filename']}]({download_url})"
+                    text_pos = final_response_text.find(link_text)
+                    if text_pos < 0:
+                        text_pos = 0
                     if download_url and not download_url.startswith("file:"):
-                        link_text = f"[{f_obj['filename']}]({download_url})"
-                        start = final_response_text.find(link_text)
                         file_annotations.append({
                             "type": "url_citation",
                             "url": download_url,
                             "title": f_obj["filename"],
-                            "start_index": start if start >= 0 else 0,
-                            "end_index": (start + len(link_text)) if start >= 0 else 0,
+                            "start_index": text_pos,
+                            "end_index": text_pos + len(link_text),
                         })
                     else:
                         file_annotations.append({
@@ -3665,12 +3668,6 @@ class APIServerAdapter(BasePlatformAdapter):
                             "filename": f_obj["filename"],
                             "index": idx,
                         })
-
-            # Sort annotations by position in text so they appear in
-            # natural reading order (smallest start_index first).
-            file_annotations.sort(
-                key=lambda a: a.get("start_index", a.get("index", 0))
-            )
 
             if message_opened:
                 await _write_event("response.output_text.done", {
@@ -4095,19 +4092,23 @@ class APIServerAdapter(BasePlatformAdapter):
         # ``url_citation`` that points to the URL's character position in
         # the response text; otherwise we emit a ``file_citation`` with
         # the file_id and filename.
+        # Build annotations for uploaded files.  Items arrive from
+        # _process_response_files already in text order.
         file_annotations: List[Dict[str, Any]] = []
         if uploaded_files:
             for idx, f_obj in enumerate(uploaded_files):
                 download_url = f_obj.get("download_url", "")
+                link_text = f"[{f_obj['filename']}]({download_url})"
+                text_pos = final_response.find(link_text)
+                if text_pos < 0:
+                    text_pos = 0
                 if download_url and not download_url.startswith("file:"):
-                    link_text = f"[{f_obj['filename']}]({download_url})"
-                    start = final_response.find(link_text)
                     file_annotations.append({
                         "type": "url_citation",
                         "url": download_url,
                         "title": f_obj["filename"],
-                        "start_index": start if start >= 0 else 0,
-                        "end_index": (start + len(link_text)) if start >= 0 else 0,
+                        "start_index": text_pos,
+                        "end_index": text_pos + len(link_text),
                     })
                 else:
                     file_annotations.append({
@@ -4116,11 +4117,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         "filename": f_obj["filename"],
                         "index": idx,
                     })
-
-        # Sort annotations by position in text (smallest start_index first).
-        file_annotations.sort(
-            key=lambda a: a.get("start_index", a.get("index", 0))
-        )
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
@@ -4891,6 +4887,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             cleaned = cleaned[:start] + replacement + cleaned[end:]
             if file_obj["id"] not in uploaded_ids:
+                file_obj["_text_pos"] = start
                 uploaded_ids.add(file_obj["id"])
                 uploaded_items.append(file_obj)
 
@@ -4916,11 +4913,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 f"[{file_obj['filename']}]({file_obj['download_url']})"
             )
             cleaned = cleaned.replace(raw, replacement, 1)
+            file_obj["_text_pos"] = match.start()
             uploaded_ids.add(file_obj["id"])
             uploaded_items.append(file_obj)
 
-        # 4. All discovered files (including images) go through the upload
-        #    pipeline.  Tags that weren't uploaded are left as-is.
+        # 4. Sort uploaded items by their original text position so they
+        #    appear in natural reading order — downstream annotation
+        #    builders and callers receive files in text order.
+        uploaded_items.sort(key=lambda f: f.pop("_text_pos", 0))
 
         return cleaned.strip(), uploaded_items
 
