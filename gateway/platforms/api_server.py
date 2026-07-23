@@ -56,6 +56,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -4931,7 +4932,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if not uploaded:
                 return file_path, None
             file_id = uploaded.get("id", "")
-            file_name = uploaded.get("filename", Path(file_path).name)
+            file_name = unquote(uploaded.get("filename", Path(file_path).name))
             file_obj: Dict[str, Any] = {
                 "id": file_id,
                 "object": "file",
